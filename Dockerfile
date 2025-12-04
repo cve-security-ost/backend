@@ -1,18 +1,23 @@
-FROM golang:1.25.1-alpine AS builder
+FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-COPY . .
+# Önce dependency dosyalarını kopyala
+COPY go.mod go.sum ./
 
+# Dependencies indir
 RUN go mod download
 
+# Sonra kaynak kodu kopyala
+COPY . .
 
+# Build
 RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server .
 
 FROM scratch
 
 COPY --from=builder /app/server /server
 
-EXPOSE 8000
+EXPOSE 8080
 
 ENTRYPOINT ["/server"]
