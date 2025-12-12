@@ -125,6 +125,15 @@ type AppMatchDetailResponse struct {
 	Matches []MatchDetail `json:"matches"`
 }
 
+type CveRecord struct {
+	CveID       string   `json:"cve_id"`
+	Vendor      string   `json:"vendor"`
+	Product     string   `json:"product"`
+	Severity    string   `json:"severity"`
+	CvssScore   *float64 `json:"cvss_score,omitempty"`
+	Description string   `json:"description,omitempty"`
+}
+
 func main() {
 	// 1. DB bağlantısını aç
 	initDB()
@@ -136,12 +145,13 @@ func main() {
 	// Health check
 	mux.HandleFunc("/health", handleHealth)
 
-	// Stats endpoint (birleşik)
+	// API endpoints
 	mux.HandleFunc("/api/stats", handleStats)
+	mux.HandleFunc("/api/stats/severity", handleSeverityStats)
 
-	// CVE endpoints
-	mux.HandleFunc("/api/cves", handleCVEList)
-	mux.HandleFunc("/api/cves/", handleCVEDetail)
+	// CVE endpoints (GET list/detail + POST/PUT/DELETE)
+	mux.HandleFunc("/api/cves", handleCVERoot)
+	mux.HandleFunc("/api/cves/", handleCVEByID) // path param: /api/cves/{id}
 
 	// Matching endpoints
 	mux.HandleFunc("/api/matching/summary", handleMatchingSummary)
@@ -216,7 +226,7 @@ func initDB() {
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 		if r.Method == "OPTIONS" {
@@ -340,6 +350,50 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// GET only: severity dağılımı (sade)
+func handleSeverityStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT COALESCE(severity, 'UNKNOWN') AS severity, COUNT(*)
+		FROM cve_records
+		GROUP BY severity
+		ORDER BY COUNT(*) DESC
+	`)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		log.Printf("Query error: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var stats []SeverityStat
+
+	for rows.Next() {
+		var s SeverityStat
+		if err := rows.Scan(&s.Severity, &s.Count); err != nil {
+			http.Error(w, "Scan error", http.StatusInternalServerError)
+			log.Printf("Scan error: %v", err)
+			return
+		}
+		stats = append(stats, s)
+	}
+
+	if err := rows.Err(); err != nil {
+		http.Error(w, "Rows error", http.StatusInternalServerError)
+		log.Printf("Rows error: %v", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(stats); err != nil {
+		log.Printf("Encode error: %v", err)
+	}
 }
 
 // GET /api/cves?page=1&page_size=50&severity=HIGH&vendor=microsoft&search=remote
@@ -722,4 +776,172 @@ func handleMatchingAppDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(resp)
+}
+
+// /api/cves -> GET list (mevcut handler), POST create
+func handleCVERoot(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		handleCVEList(w, r)
+	case http.MethodPost:
+		handleCreateCve(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// /api/cves/{id} -> GET one (detay handler), PUT update, DELETE remove
+func handleCVEByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/cves/")
+	if id == "" || id == "/api/cves" {
+		http.Error(w, "Missing id", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		handleCVEDetail(w, r)
+	case http.MethodPut:
+		handleUpdateCve(w, r, id)
+	case http.MethodDelete:
+		handleDeleteCve(w, r, id)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleCreateCve(w http.ResponseWriter, r *http.Request) {
+	var payload CveRecord
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(payload.CveID) == "" {
+		http.Error(w, "cve_id is required", http.StatusBadRequest)
+		return
+	}
+
+	rec, err := insertCve(r.Context(), payload)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		log.Printf("insert error: %v", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(rec)
+}
+
+func handleUpdateCve(w http.ResponseWriter, r *http.Request, id string) {
+	var payload CveRecord
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if strings.TrimSpace(payload.CveID) == "" {
+		payload.CveID = id // path öncelikli olsun
+	}
+
+	updated, err := updateCve(r.Context(), id, payload)
+	if err == sql.ErrNoRows {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		log.Printf("update error: %v", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(updated)
+}
+
+func handleDeleteCve(w http.ResponseWriter, r *http.Request, id string) {
+	rows, err := db.ExecContext(r.Context(), `DELETE FROM cve_records WHERE cve_id=$1`, id)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		log.Printf("delete error: %v", err)
+		return
+	}
+	affected, _ := rows.RowsAffected()
+	if affected == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func insertCve(ctx context.Context, payload CveRecord) (CveRecord, error) {
+	row := db.QueryRowContext(ctx, `
+		INSERT INTO cve_records (cve_id, vendor, product, severity, cvss_score, description)
+		VALUES ($1,$2,$3,$4,$5,$6)
+		RETURNING cve_id, vendor, product, severity, cvss_score, description
+	`,
+		payload.CveID,
+		payload.Vendor,
+		payload.Product,
+		payload.Severity,
+		payload.CvssScore,
+		payload.Description,
+	)
+	return scanCve(row)
+}
+
+func updateCve(ctx context.Context, id string, payload CveRecord) (CveRecord, error) {
+	row := db.QueryRowContext(ctx, `
+		UPDATE cve_records
+		SET vendor=$2, product=$3, severity=$4, cvss_score=$5, description=$6
+		WHERE cve_id=$1
+		RETURNING cve_id, vendor, product, severity, cvss_score, description
+	`,
+		id,
+		payload.Vendor,
+		payload.Product,
+		payload.Severity,
+		payload.CvssScore,
+		payload.Description,
+	)
+	return scanCve(row)
+}
+
+// scanCve accepts both *sql.Row and *sql.Rows
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanCve(rs rowScanner) (CveRecord, error) {
+	var rec CveRecord
+	var cvss sql.NullFloat64
+	var vendor, product, severity, description sql.NullString
+
+	err := rs.Scan(
+		&rec.CveID,
+		&vendor,
+		&product,
+		&severity,
+		&cvss,
+		&description,
+	)
+	if err != nil {
+		return rec, err
+	}
+	if vendor.Valid {
+		rec.Vendor = vendor.String
+	}
+	if product.Valid {
+		rec.Product = product.String
+	}
+	if severity.Valid {
+		rec.Severity = severity.String
+	}
+	if description.Valid {
+		rec.Description = description.String
+	}
+	if cvss.Valid {
+		rec.CvssScore = &cvss.Float64
+	}
+	return rec, nil
 }
