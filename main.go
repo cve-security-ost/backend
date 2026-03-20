@@ -171,6 +171,13 @@ func main() {
 	mux.HandleFunc("/api/applications", handleApplicationsRoot)
 	mux.HandleFunc("/api/applications/", handleApplicationByID)
 
+	// ML proxy endpoints
+	mux.HandleFunc("/api/ml/match", handleMLMatch)
+	mux.HandleFunc("/api/ml/predict-severity", handleMLSeverity)
+	mux.HandleFunc("/api/ml/health", handleMLHealth)
+	mux.HandleFunc("/api/ml/scan/", handleMLScan)
+	mux.HandleFunc("/api/ml/results", handleMLResults)
+
 	// CORS middleware ile wrap et
 	handler := corsMiddleware(mux)
 
