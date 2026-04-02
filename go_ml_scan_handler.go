@@ -117,7 +117,7 @@ func handleMLScan(w http.ResponseWriter, r *http.Request) {
 	sendLog("SBERT embedding hesaplanıyor (all-MiniLM-L6-v2)…")
 	startTime := time.Now()
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 300 * time.Second}
 	resp, err := client.Post(mlURL, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		sendEvent("error", "error", "ML servisi yanıt vermedi: "+err.Error(), 0)

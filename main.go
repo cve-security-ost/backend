@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,7 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	_ "github.com/lib/pq" // PostgreSQL driver
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 var db *sql.DB
@@ -178,6 +182,11 @@ func main() {
 	mux.HandleFunc("/api/ml/scan/", handleMLScan)
 	mux.HandleFunc("/api/ml/results", handleMLResults)
 
+	// Scanner endpoints
+	mux.HandleFunc("/api/scan/submit", handleScanSubmit)
+	mux.HandleFunc("/api/scan/status/", handleScanStatus)
+	mux.HandleFunc("/api/scan/results/", handleScanResults)
+
 	// CORS middleware ile wrap et
 	handler := corsMiddleware(mux)
 
@@ -191,7 +200,7 @@ func main() {
 		Addr:         ":" + port,
 		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: 600 * time.Second,
 	}
 
 	// 4. Graceful shutdown için goroutine
@@ -1777,3 +1786,269 @@ func saveMatchingResults(appID string, matches []MatchResult) {
 	}
 	log.Printf("Saved %d matching results for app %s", len(matches), appID)
 }
+
+// =============================================
+// Scanner Endpoints
+// =============================================
+
+type ScanApp struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type ScanSubmitRequest struct {
+	Apps []ScanApp `json:"apps"`
+}
+
+type ScanSubmitResponse struct {
+	JobID    string `json:"job_id"`
+	Status   string `json:"status"`
+	AppCount int    `json:"app_count"`
+}
+
+type ScanStatusResponse struct {
+	JobID       string           `json:"job_id"`
+	Status      string           `json:"status"`
+	Progress    int              `json:"progress"`
+	AppCount    int              `json:"app_count"`
+	CreatedAt   string           `json:"created_at"`
+	CompletedAt *string          `json:"completed_at,omitempty"`
+	Results     *json.RawMessage `json:"results,omitempty"`
+}
+
+// POST /api/scan/submit
+func handleScanSubmit(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "method_not_allowed"})
+		return
+	}
+
+	var req ScanSubmitRequest
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid_request_body"})
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "invalid_json"})
+		return
+	}
+
+	if len(req.Apps) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "apps_required"})
+		return
+	}
+	if len(req.Apps) > 20 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "max_20_apps_allowed"})
+		return
+	}
+
+	jobID := uuid.New().String()
+
+	// Insert job into DB
+	_, err = db.Exec(`
+		INSERT INTO scan_jobs (id, status, app_count, created_at)
+		VALUES ($1, 'queued', $2, NOW())
+	`, jobID, len(req.Apps))
+	if err != nil {
+		log.Printf("[Scan] DB insert error: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "database_error"})
+		return
+	}
+
+	// Publish to RabbitMQ
+	mqMsg := map[string]interface{}{
+		"job_id": jobID,
+		"apps":   req.Apps,
+	}
+	mqBody, _ := json.Marshal(mqMsg)
+
+	go func() {
+		if err := publishToRabbitMQ("scan_jobs", mqBody); err != nil {
+			log.Printf("[Scan] RabbitMQ publish error: %v", err)
+			db.Exec(`UPDATE scan_jobs SET status = 'failed' WHERE id = $1`, jobID)
+		}
+	}()
+
+	resp := ScanSubmitResponse{
+		JobID:    jobID,
+		Status:   "queued",
+		AppCount: len(req.Apps),
+	}
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(resp)
+}
+
+// GET /api/scan/status/{job_id}
+func handleScanStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "method_not_allowed"})
+		return
+	}
+
+	jobID := strings.TrimPrefix(r.URL.Path, "/api/scan/status/")
+	if jobID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "job_id_required"})
+		return
+	}
+
+	var resp ScanStatusResponse
+	var createdAt time.Time
+	var completedAt sql.NullTime
+	var resultsJSON sql.NullString
+
+	err := db.QueryRow(`
+		SELECT id, status, progress, app_count, created_at, completed_at, results::text
+		FROM scan_jobs WHERE id = $1
+	`, jobID).Scan(&resp.JobID, &resp.Status, &resp.Progress, &resp.AppCount,
+		&createdAt, &completedAt, &resultsJSON)
+
+	if err == sql.ErrNoRows {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "job_not_found"})
+		return
+	}
+	if err != nil {
+		log.Printf("[Scan] DB query error: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "database_error"})
+		return
+	}
+
+	resp.CreatedAt = createdAt.Format(time.RFC3339)
+	if completedAt.Valid {
+		t := completedAt.Time.Format(time.RFC3339)
+		resp.CompletedAt = &t
+	}
+	if resultsJSON.Valid && resp.Status == "completed" {
+		raw := json.RawMessage(resultsJSON.String)
+		resp.Results = &raw
+	}
+
+	json.NewEncoder(w).Encode(resp)
+}
+
+// GET /api/scan/results/{job_id}
+func handleScanResults(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "method_not_allowed"})
+		return
+	}
+
+	jobID := strings.TrimPrefix(r.URL.Path, "/api/scan/results/")
+	if jobID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "job_id_required"})
+		return
+	}
+
+	var status string
+	var resultsJSON sql.NullString
+	var completedAt sql.NullTime
+
+	err := db.QueryRow(`
+		SELECT status, results::text, completed_at
+		FROM scan_jobs WHERE id = $1
+	`, jobID).Scan(&status, &resultsJSON, &completedAt)
+
+	if err == sql.ErrNoRows {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "job_not_found"})
+		return
+	}
+	if err != nil {
+		log.Printf("[Scan] DB query error: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "database_error"})
+		return
+	}
+
+	if status != "completed" {
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":  "job_not_completed",
+			"status": status,
+		})
+		return
+	}
+
+	result := map[string]interface{}{
+		"job_id": jobID,
+	}
+	if completedAt.Valid {
+		result["completed_at"] = completedAt.Time.Format(time.RFC3339)
+	}
+	if resultsJSON.Valid {
+		var apps json.RawMessage
+		json.Unmarshal([]byte(resultsJSON.String), &apps)
+		result["apps"] = apps
+	}
+
+	json.NewEncoder(w).Encode(result)
+}
+
+// publishToRabbitMQ - RabbitMQ'ya mesaj gönder
+func publishToRabbitMQ(queue string, body []byte) error {
+	mqURL := os.Getenv("RABBITMQ_URL")
+	if mqURL == "" {
+		mqURL = "amqp://guest:guest@localhost:5672/"
+	}
+
+	conn, err := amqp.Dial(mqURL)
+	if err != nil {
+		return fmt.Errorf("rabbitmq connect: %w", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		return fmt.Errorf("rabbitmq channel: %w", err)
+	}
+	defer ch.Close()
+
+	_, err = ch.QueueDeclare(queue, true, false, false, false, nil)
+	if err != nil {
+		return fmt.Errorf("rabbitmq queue declare: %w", err)
+	}
+
+	err = ch.PublishWithContext(
+		context.Background(),
+		"",
+		queue,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			Body:         body,
+			DeliveryMode: amqp.Persistent,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("rabbitmq publish: %w", err)
+	}
+
+	log.Printf("[Scan] Published job to RabbitMQ queue '%s'", queue)
+	return nil
+}
+
+// Unused import suppressor — bytes is used by scanner HTTP calls
+var _ = bytes.NewReader
