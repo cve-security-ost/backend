@@ -1,0 +1,76 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go-test:
+    name: Go Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests
+        run: go test -v -count=1 -coverprofile=coverage.out ./...
+
+      - name: Display coverage
+        run: go tool cover -func=coverage.out
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-coverage
+          path: coverage.out
+
+  go-security:
+    name: Go Security Scan (gosec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Run gosec
+        run: gosec -fmt json -out gosec-report.json ./... || true
+
+      - name: Display findings
+        run: cat gosec-report.json | python3 -m json.tool || true
+
+      - name: Upload gosec report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gosec-report
+          path: gosec-report.json
+
+  go-lint:
+    name: Go Lint (staticcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Run staticcheck
+        run: staticcheck ./... || true
