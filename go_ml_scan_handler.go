@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -71,6 +72,8 @@ func handleMLScan(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// nginx buffering'i tamamen kapat (frontend nginx proxy_buffering off + bu da garanti)
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -118,11 +121,39 @@ func handleMLScan(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 
 	client := &http.Client{Timeout: 300 * time.Second}
-	resp, err := client.Post(mlURL, "application/json", bytes.NewReader(reqBody))
-	if err != nil {
-		sendEvent("error", "error", "ML servisi yanıt vermedi: "+err.Error(), 0)
-		sendLog("HATA: " + err.Error())
-		return
+
+	// ML call'u goroutine'de — parent her 500ms heartbeat log gönderir, donmuş hissi olmaz
+	type mlResult struct {
+		resp *http.Response
+		err  error
+	}
+	mlCh := make(chan mlResult, 1)
+	go func() {
+		r, err := client.Post(mlURL, "application/json", bytes.NewReader(reqBody))
+		mlCh <- mlResult{resp: r, err: err}
+	}()
+
+	var resp *http.Response
+	ticker := time.NewTicker(500 * time.Millisecond)
+HEARTBEAT:
+	for {
+		select {
+		case res := <-mlCh:
+			ticker.Stop()
+			if res.err != nil {
+				sendEvent("error", "error", "ML servisi yanıt vermedi: "+res.err.Error(), 0)
+				sendLog("HATA: " + res.err.Error())
+				return
+			}
+			resp = res.resp
+			break HEARTBEAT
+		case <-ticker.C:
+			elapsed := time.Since(startTime)
+			sendLog(fmt.Sprintf("…SBERT hesaplanıyor (%dms geçti)", elapsed.Milliseconds()))
+		case <-r.Context().Done():
+			ticker.Stop()
+			return // Client disconnect
+		}
 	}
 	defer resp.Body.Close()
 
@@ -163,8 +194,7 @@ func handleMLScan(w http.ResponseWriter, r *http.Request) {
 	sendEvent("tfidf", "done", "TF-IDF reranking tamamlandı", len(mlResp.Results))
 
 	sendEvent("rerank", "running", "CASCADE skorları hesaplanıyor…", 0)
-	sendLog("CASCADE Rerank: 0.85×SBERT + 0.15×TF-IDF hibrit skor")
-	time.Sleep(200 * time.Millisecond)
+	sendLog("CASCADE Rerank: 1.00×SBERT (tez Tablo 4.2 kazananı, MAP@5=0.705)")
 
 	// Skor dağılımını logla
 	if len(mlResp.Results) > 0 {
@@ -200,35 +230,51 @@ func handleMLScan(w http.ResponseWriter, r *http.Request) {
 	batchURL := getMLServiceURL() + "/ml/predict-severity/batch"
 	modelTypes := []string{"lightgbm", "xgboost", "distilbert"}
 
-	// Her model için tek batch çağrı (60 çağrı → 3 çağrı)
+	// 3 modeli PARALEL çağır — sıralı vs paralel: ~3× hız (3-6sn → 1-2sn)
 	batchResults := make(map[string][]SeverityPrediction)
-	for _, mt := range modelTypes {
-		batchReqBody, _ := json.Marshal(map[string]interface{}{
-			"descriptions": descriptions,
-			"model_type":   mt,
-		})
-		sendLog(fmt.Sprintf("  %s batch çağrılıyor (%d CVE)…", mt, len(descriptions)))
-		batchResp, err := client.Post(batchURL, "application/json", bytes.NewReader(batchReqBody))
-		if err != nil {
-			sendLog(fmt.Sprintf("  HATA: %s batch başarısız: %v", mt, err))
-			continue
-		}
-		batchBody, _ := io.ReadAll(batchResp.Body)
-		batchResp.Body.Close()
+	var batchMu sync.Mutex
+	var wg sync.WaitGroup
+	sevStart := time.Now()
+	sendLog(fmt.Sprintf("3 model paralel çağrılıyor (lightgbm + xgboost + distilbert × %d CVE)…", len(descriptions)))
 
-		// Batch endpoint direkt array dönüyor: [...]
-		var preds []SeverityPrediction
-		if err := json.Unmarshal(batchBody, &preds); err != nil {
-			errSnip := string(batchBody)
-			if len(errSnip) > 100 {
-				errSnip = errSnip[:100]
+	for _, mt := range modelTypes {
+		wg.Add(1)
+		go func(model string) {
+			defer wg.Done()
+			batchReqBody, _ := json.Marshal(map[string]interface{}{
+				"descriptions": descriptions,
+				"model_type":   model,
+			})
+			t0 := time.Now()
+			batchResp, err := client.Post(batchURL, "application/json", bytes.NewReader(batchReqBody))
+			if err != nil {
+				batchMu.Lock()
+				sendLog(fmt.Sprintf("  HATA: %s batch başarısız: %v", model, err))
+				batchMu.Unlock()
+				return
 			}
-			sendLog(fmt.Sprintf("  HATA: %s parse başarısız: %s", mt, errSnip))
-			continue
-		}
-		batchResults[mt] = preds
-		sendLog(fmt.Sprintf("  %s tamamlandı (%d sonuç)", mt, len(preds)))
+			batchBody, _ := io.ReadAll(batchResp.Body)
+			batchResp.Body.Close()
+
+			var preds []SeverityPrediction
+			if err := json.Unmarshal(batchBody, &preds); err != nil {
+				errSnip := string(batchBody)
+				if len(errSnip) > 100 {
+					errSnip = errSnip[:100]
+				}
+				batchMu.Lock()
+				sendLog(fmt.Sprintf("  HATA: %s parse başarısız: %s", model, errSnip))
+				batchMu.Unlock()
+				return
+			}
+			batchMu.Lock()
+			batchResults[model] = preds
+			sendLog(fmt.Sprintf("  %s tamamlandı (%d sonuç, %dms)", model, len(preds), time.Since(t0).Milliseconds()))
+			batchMu.Unlock()
+		}(mt)
 	}
+	wg.Wait()
+	sendLog(fmt.Sprintf("Paralel severity tamamlandı: toplam %dms (sıralı olsaydı ~3×)", time.Since(sevStart).Milliseconds()))
 
 	// Sonuçları birleştir
 	for i, r := range mlResp.Results {
@@ -258,38 +304,55 @@ func handleMLScan(w http.ResponseWriter, r *http.Request) {
 
 	// ── 4. Sonuçları DB'ye yaz ────────────────────────────────
 	sendEvent("save", "running", "Sonuçlar veritabanına kaydediliyor…", 0)
-	sendLog(fmt.Sprintf("PostgreSQL'e yazılıyor: %d kayıt → matching_results tablosu", len(mlResp.Results)))
+	sendLog(fmt.Sprintf("PostgreSQL'e yazılıyor: %d kayıt → matching_results tablosu (tek transaction)", len(mlResp.Results)))
+
+	dbStart := time.Now()
+	tx, err := db.Begin()
+	if err != nil {
+		sendEvent("error", "error", "DB transaction başlatılamadı", 0)
+		sendLog("HATA: " + err.Error())
+		return
+	}
+	stmt, err := tx.Prepare(`
+		INSERT INTO matching_results
+			(app_id, cve_id, algorithm, score, sbert_score, tfidf_score, cascade_score, match_type, source,
+			 sev_lightgbm, sev_lightgbm_conf, sev_xgboost, sev_xgboost_conf, sev_distilbert, sev_distilbert_conf,
+			 predicted_severity, severity_confidence)
+		VALUES ($1, $2, 'ml_cascade', $3, $4, $5, $6, $7, 'ml_cascade',
+			$8, $9, $10, $11, $12, $13, $14, $15)
+		ON CONFLICT (app_id, cve_id, algorithm) DO UPDATE SET
+			score                = EXCLUDED.score,
+			sbert_score          = EXCLUDED.sbert_score,
+			tfidf_score          = EXCLUDED.tfidf_score,
+			cascade_score        = EXCLUDED.cascade_score,
+			match_type           = EXCLUDED.match_type,
+			source               = 'ml_cascade',
+			sev_lightgbm         = EXCLUDED.sev_lightgbm,
+			sev_lightgbm_conf    = EXCLUDED.sev_lightgbm_conf,
+			sev_xgboost          = EXCLUDED.sev_xgboost,
+			sev_xgboost_conf     = EXCLUDED.sev_xgboost_conf,
+			sev_distilbert       = EXCLUDED.sev_distilbert,
+			sev_distilbert_conf  = EXCLUDED.sev_distilbert_conf,
+			predicted_severity   = EXCLUDED.predicted_severity,
+			severity_confidence  = EXCLUDED.severity_confidence
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		sendEvent("error", "error", "DB prepare hatası", 0)
+		sendLog("HATA: " + err.Error())
+		return
+	}
 
 	saved := 0
 	for _, r := range mlResp.Results {
 		three := sevMap[r.CveID]
-		_, err := db.Exec(`
-			INSERT INTO matching_results
-				(app_id, cve_id, algorithm, score, sbert_score, tfidf_score, cascade_score, match_type, source,
-				 sev_lightgbm, sev_lightgbm_conf, sev_xgboost, sev_xgboost_conf, sev_distilbert, sev_distilbert_conf,
-				 predicted_severity, severity_confidence)
-			VALUES ($1, $2, 'ml_cascade', $3, $4, $5, $6, $7, 'ml_cascade',
-				$8, $9, $10, $11, $12, $13, $14, $15)
-			ON CONFLICT (app_id, cve_id, algorithm) DO UPDATE SET
-				score                = EXCLUDED.score,
-				sbert_score          = EXCLUDED.sbert_score,
-				tfidf_score          = EXCLUDED.tfidf_score,
-				cascade_score        = EXCLUDED.cascade_score,
-				match_type           = EXCLUDED.match_type,
-				source               = 'ml_cascade',
-				sev_lightgbm         = EXCLUDED.sev_lightgbm,
-				sev_lightgbm_conf    = EXCLUDED.sev_lightgbm_conf,
-				sev_xgboost          = EXCLUDED.sev_xgboost,
-				sev_xgboost_conf     = EXCLUDED.sev_xgboost_conf,
-				sev_distilbert       = EXCLUDED.sev_distilbert,
-				sev_distilbert_conf  = EXCLUDED.sev_distilbert_conf,
-				predicted_severity   = EXCLUDED.predicted_severity,
-				severity_confidence  = EXCLUDED.severity_confidence
-		`, appID, r.CveID, r.Score, r.SbertScore, r.TfidfScore, r.Score, r.MatchType,
+		_, err := stmt.Exec(
+			appID, r.CveID, r.Score, r.SbertScore, r.TfidfScore, r.Score, r.MatchType,
 			three.LightGBM.Severity, three.LightGBM.Confidence,
 			three.XGBoost.Severity, three.XGBoost.Confidence,
 			three.DistilBERT.Severity, three.DistilBERT.Confidence,
-			three.DistilBERT.Severity, three.DistilBERT.Confidence)
+			three.DistilBERT.Severity, three.DistilBERT.Confidence,
+		)
 		if err != nil {
 			log.Printf("[ML Scan] DB write error for %s: %v", r.CveID, err)
 			sendLog(fmt.Sprintf("DB HATA: %s → %v", r.CveID, err))
@@ -297,8 +360,16 @@ func handleMLScan(w http.ResponseWriter, r *http.Request) {
 		}
 		saved++
 	}
+	_ = stmt.Close()
 
-	sendLog(fmt.Sprintf("DB kayıt tamamlandı: %d/%d başarılı", saved, len(mlResp.Results)))
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		sendEvent("error", "error", "DB commit hatası", 0)
+		sendLog("HATA: " + err.Error())
+		return
+	}
+
+	sendLog(fmt.Sprintf("DB kayıt tamamlandı: %d/%d başarılı (%dms, tek transaction)", saved, len(mlResp.Results), time.Since(dbStart).Milliseconds()))
 	sendEvent("save", "done", fmt.Sprintf("%d sonuç kaydedildi", saved), saved)
 	sendEvent("done", "done", "Tarama tamamlandı", saved)
 }
