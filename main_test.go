@@ -158,7 +158,7 @@ func TestHandleStats_OK(t *testing.T) {
 			AddRow("CRITICAL", 21000))
 
 	// Top vendors
-	mock.ExpectQuery("SELECT COALESCE\\(vendor").
+	mock.ExpectQuery("SELECT COALESCE\\(c\\.vendor").
 		WillReturnRows(sqlmock.NewRows([]string{"vendor", "cve_count"}).
 			AddRow("microsoft", 5000).
 			AddRow("google", 3000))

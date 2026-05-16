@@ -292,18 +292,23 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 
 	var resp StatsResponse
 
-	// 1. Total CVE count
-	if err := db.QueryRow("SELECT COUNT(*) FROM cve_records").Scan(&resp.TotalCves); err != nil {
+	// 1. Total CVE count (sadece ML temiz set: 282k)
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM cve_records c
+		JOIN ml_clean_cves m ON m.cve_id = c.cve_id
+	`).Scan(&resp.TotalCves); err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		log.Printf("Total count error: %v", err)
 		return
 	}
 
-	// 2. Severity distribution
+	// 2. Severity distribution (ML temiz set içinden)
 	severityRows, err := db.Query(`
-		SELECT COALESCE(severity, 'UNKNOWN') AS severity, COUNT(*)
-		FROM cve_records
-		GROUP BY severity
+		SELECT COALESCE(c.severity, 'UNKNOWN') AS severity, COUNT(*)
+		FROM cve_records c
+		JOIN ml_clean_cves m ON m.cve_id = c.cve_id
+		GROUP BY c.severity
 		ORDER BY COUNT(*) DESC
 	`)
 	if err != nil {
@@ -324,12 +329,13 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		resp.SeverityDistribution = append(resp.SeverityDistribution, s)
 	}
 
-	// 3. Top 10 vendors
+	// 3. Top 10 vendors (ML temiz set içinden)
 	vendorRows, err := db.Query(`
-		SELECT COALESCE(vendor, 'unknown') AS vendor, COUNT(*) as cve_count
-		FROM cve_records
-		WHERE vendor IS NOT NULL AND vendor != '' AND vendor != 'n/a'
-		GROUP BY vendor
+		SELECT COALESCE(c.vendor, 'unknown') AS vendor, COUNT(*) as cve_count
+		FROM cve_records c
+		JOIN ml_clean_cves m ON m.cve_id = c.cve_id
+		WHERE c.vendor IS NOT NULL AND c.vendor != '' AND c.vendor != 'n/a'
+		GROUP BY c.vendor
 		ORDER BY cve_count DESC
 		LIMIT 10
 	`)
@@ -351,11 +357,12 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		resp.TopVendors = append(resp.TopVendors, v)
 	}
 
-	// 4. Yearly distribution (sadece published_date olan kayıtlar)
+	// 4. Yearly distribution (ML temiz set içinden, published_date olanlar)
 	yearlyRows, err := db.Query(`
-		SELECT EXTRACT(YEAR FROM published_date)::int AS year, COUNT(*)
-		FROM cve_records
-		WHERE published_date IS NOT NULL
+		SELECT EXTRACT(YEAR FROM c.published_date)::int AS year, COUNT(*)
+		FROM cve_records c
+		JOIN ml_clean_cves m ON m.cve_id = c.cve_id
+		WHERE c.published_date IS NOT NULL
 		GROUP BY year
 		ORDER BY year DESC
 	`)
@@ -389,9 +396,10 @@ func handleSeverityStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-		SELECT COALESCE(severity, 'UNKNOWN') AS severity, COUNT(*)
-		FROM cve_records
-		GROUP BY severity
+		SELECT COALESCE(c.severity, 'UNKNOWN') AS severity, COUNT(*)
+		FROM cve_records c
+		JOIN ml_clean_cves m ON m.cve_id = c.cve_id
+		GROUP BY c.severity
 		ORDER BY COUNT(*) DESC
 	`)
 	if err != nil {
