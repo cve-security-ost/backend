@@ -194,7 +194,7 @@ HEARTBEAT:
 	sendEvent("tfidf", "done", "TF-IDF reranking tamamlandı", len(mlResp.Results))
 
 	sendEvent("rerank", "running", "CASCADE skorları hesaplanıyor…", 0)
-	sendLog("CASCADE Rerank: 1.00×SBERT (tez Tablo 4.2 kazananı, MAP@5=0.705)")
+	sendLog("CASCADE Rerank: 1.00×SBERT (MAP@5=0.705)")
 
 	// Skor dağılımını logla
 	if len(mlResp.Results) > 0 {
