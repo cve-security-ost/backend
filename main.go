@@ -1668,25 +1668,33 @@ func calculateHybridScore(appName, vendor string, appWords []string, cveVendor, 
 	}
 
 	// ===== VENDOR SCORING =====
+	// Not: vendorScore saturasyonu engellemek icin 10'dan 5'e dusuruldu.
+	// Eski formulde vendor-tam-eslesme tek basina base(90)+vendor(10)=100 ile
+	// ust tavanin urunlerine carpiyor ve Layer 1'deki butun sonuclar
+	// "Skor: 100" gosteriyordu (productScore + wordBonus etkisini kaybediyor).
 	vendorScore := 0.0
 	if cveVendorLower != "" && vendor != "" {
 		// Tam eşleşme
 		if cveVendorLower == vendor {
-			vendorScore = 10.0
+			vendorScore = 5.0
 		} else {
 			// Fuzzy score hesapla
 			fuzzy := fuzzyScore(vendor, cveVendorLower)
 			tokenSet := tokenSetRatio(vendor, cveVendorLower)
-			vendorScore = (fuzzy + tokenSet) / 2 / 10 // Max 10 puan
+			vendorScore = (fuzzy + tokenSet) / 2 / 20 // Max 5 puan
 		}
 	}
 
 	// ===== PRODUCT SCORING =====
+	// Not: productScore max'i 15 -> 10. Vendor 5 + Product 10 = 15 puanlik
+	// "icerik benzerligi" alani, geri kalan farklilasma productScore'un fuzzy
+	// kismindan geliyor (ayni vendor altinda farkli CVE'ler farkli skorlar
+	// alabilsin).
 	productScore := 0.0
 	if cveProductLower != "" && appName != "" {
 		// Tam eşleşme
 		if cveProductLower == appName {
-			productScore = 15.0
+			productScore = 10.0
 		} else {
 			// Fuzzy score hesapla
 			fuzzy := fuzzyScore(appName, cveProductLower)
@@ -1702,7 +1710,7 @@ func calculateHybridScore(appName, vendor string, appWords []string, cveVendor, 
 				bestScore = trigram
 			}
 
-			productScore = bestScore / 100 * 15 // Max 15 puan
+			productScore = bestScore / 100 * 10 // Max 10 puan
 		}
 	}
 
@@ -1728,7 +1736,10 @@ func calculateHybridScore(appName, vendor string, appWords []string, cveVendor, 
 			}
 		}
 		wordMatchRatio := float64(matchedWords) / float64(len(appWords))
-		wordBonus = wordMatchRatio * 5 // Max 5 puan
+		// Not: Layer 1'de SQL zaten "product LIKE %appName%" ile filtre yapiyor,
+		// dolayisiyla wordBonus burada hep tavana yapisirdi (max 5). Kalibrasyon
+		// sonrasi katki 2 puan ile sinirlandirildi.
+		wordBonus = wordMatchRatio * 2 // Max 2 puan
 	}
 
 	// ===== FINAL SCORE =====
@@ -1769,11 +1780,26 @@ func calculateHybridScore(appName, vendor string, appWords []string, cveVendor, 
 	return finalScore
 }
 
-// sortMatchesByScore - Skorlara göre sırala
+// sortMatchesByScore - Skorlara göre sırala (esitlikte CVSS DESC, NULL en sonda).
+// Onceki versiyon sadece Score'a bakiyordu; saturasyon nedeniyle ayni tier'daki
+// onlarca sonuc 100 puanla esitleniyor ve sira deterministik degildi. CVSS
+// tie-break ile en tehlikeli CVE'ler ust sirada kaliyor.
 func sortMatchesByScore(matches []MatchResult) {
+	cvssOf := func(m MatchResult) float64 {
+		if m.CVSSScore == nil {
+			return -1.0
+		}
+		return *m.CVSSScore
+	}
 	for i := 0; i < len(matches)-1; i++ {
 		for j := i + 1; j < len(matches); j++ {
+			swap := false
 			if matches[j].Score > matches[i].Score {
+				swap = true
+			} else if matches[j].Score == matches[i].Score && cvssOf(matches[j]) > cvssOf(matches[i]) {
+				swap = true
+			}
+			if swap {
 				matches[i], matches[j] = matches[j], matches[i]
 			}
 		}
