@@ -61,6 +61,10 @@ type CVEItem struct {
 	Product       *string    `json:"product,omitempty"`
 	Version       *string    `json:"version,omitempty"`
 	PublishedDate *time.Time `json:"published_date,omitempty"`
+	// Score: hesaplanmis "onem skoru" (0-100). CVSS sertligi + matching_results
+	// sayisindan operasyonel etki + CVE yili bazli guncellik bonusu kombinasyonu.
+	// /api/cves endpoint'i tarafindan hesaplanir, /api/cves/{id} icin null kalir.
+	Score *float64 `json:"score,omitempty"`
 }
 
 type CVEDetail struct {
@@ -495,11 +499,34 @@ func handleCVEList(w http.ResponseWriter, r *http.Request) {
 	offset := (page - 1) * pageSize
 	args = append(args, pageSize, offset)
 
+	// Onem skoru (0-100) formul kompozisyonu:
+	//   teknik siddet  : COALESCE(cvss_score, 0) * 7        -> 0-70
+	//   operasyonel    : LEAST(matching_results sayisi, 5) * 4 -> 0-20
+	//   guncellik      : CVE yili bazli bonus                -> 0-10
+	// Toplam max 100; CVSS=10, 5+ eslesme, 2025+ CVE icin tavana ulasir.
+	// matching_results.cve_id uzerinde idx_matching_cve_id index'i mevcut,
+	// subquery 20'lik sayfa boyutunda hizli kalir.
 	dataQuery := fmt.Sprintf(`
-		SELECT cve_id, description, severity, cvss_score, vendor, product, version, published_date
-		FROM cve_records
+		SELECT
+			c.cve_id, c.description, c.severity, c.cvss_score,
+			c.vendor, c.product, c.version, c.published_date,
+			(
+				COALESCE(c.cvss_score, 0) * 7
+				+ LEAST(
+					(SELECT COUNT(*) FROM matching_results m WHERE m.cve_id = c.cve_id),
+					5
+				) * 4
+				+ CASE
+					WHEN c.cve_id LIKE 'CVE-2025-%%' OR c.cve_id LIKE 'CVE-2026-%%' THEN 10
+					WHEN c.cve_id LIKE 'CVE-2024-%%' THEN 8
+					WHEN c.cve_id LIKE 'CVE-2023-%%' THEN 5
+					WHEN c.cve_id LIKE 'CVE-2022-%%' THEN 3
+					ELSE 0
+				END
+			)::float8 AS score
+		FROM cve_records c
 		%s
-		ORDER BY cvss_score DESC NULLS LAST, cve_id DESC
+		ORDER BY score DESC, c.cve_id DESC
 		LIMIT $%d OFFSET $%d
 	`, whereClause, argIndex, argIndex+1)
 
@@ -515,7 +542,7 @@ func handleCVEList(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var c CVEItem
 		if err := rows.Scan(&c.CVEID, &c.Description, &c.Severity, &c.CVSSScore,
-			&c.Vendor, &c.Product, &c.Version, &c.PublishedDate); err != nil {
+			&c.Vendor, &c.Product, &c.Version, &c.PublishedDate, &c.Score); err != nil {
 			http.Error(w, "Scan error", http.StatusInternalServerError)
 			log.Printf("Scan error: %v", err)
 			return
