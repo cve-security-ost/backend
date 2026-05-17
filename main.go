@@ -839,7 +839,11 @@ func handleMatchingAppDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Matching results with CVE details
+	// Matching results with CVE details.
+	// ml_cascade satirlarini disla: 4 katmanli cascade (exact/fuzzy/semantic/vendor)
+	// ana algoritma; ml_cascade ayri ML scan endpoint'inden gelen deneysel ciktidir
+	// ve score'u SBERT cosine 0-1 skalasinda oldugundan UI'in 0-100 skalasinda
+	// 0% gosterilip yanlis sinyal veriyordu.
 	rows, err := db.Query(`
 		SELECT
 			m.algorithm,
@@ -850,6 +854,8 @@ func handleMatchingAppDetail(w http.ResponseWriter, r *http.Request) {
 		FROM matching_results m
 		LEFT JOIN cve_records c ON m.cve_id = c.cve_id
 		WHERE m.app_id = $1
+		  AND m.algorithm <> 'ml_cascade'
+		  AND COALESCE(m.source, '') <> 'ml_cascade'
 		ORDER BY m.algorithm, m.score DESC
 	`, appID)
 
